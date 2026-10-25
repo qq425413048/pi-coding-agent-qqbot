@@ -130,6 +130,12 @@ export class PiQQBotRuntime {
 	private state: ConnectionState = "disconnected";
 	private stateDetail?: string;
 	private lastError?: string;
+	/** 当前正在执行的工具调用摘要（供长任务心跳展示） */
+	private activeToolStatus?: string;
+	/** 距上次心跳之间发生的工具调用（纯内存记录，不发起任何请求） */
+	private toolTrail: string[] = [];
+	/** 每个会话进行中的心跳定时器 */
+	private readonly heartbeatTimers = new Map<string, ReturnType<typeof setInterval>>();
 	private lastAttachmentError?: string;
 	private activeAttachmentStatus?: string;
 	private lastOutboundMediaError?: string;
@@ -733,12 +739,51 @@ export class PiQQBotRuntime {
 		};
 		if (this.config.progress.ackAfterMs <= 0) sendAck();
 		else input.ackTimer = setTimeout(sendAck, this.config.progress.ackAfterMs);
+
+		// 长任务心跳：每 heartbeatMs 用主动消息汇报一次进度与最近操作
+		const hbMs = this.config.progress.heartbeatMs;
+		if (hbMs > 0) {
+			const msg = input.msg;
+			const startedAt = Date.now();
+			const timer = setInterval(() => {
+				if (input.ackCancelled || active.stopped || this.activeConversation !== active || !this.running) return;
+				const secs = Math.round((Date.now() - startedAt) / 1000);
+				const doing = this.activeToolStatus ? `，正在执行 ${this.activeToolStatus}` : "，正在生成回复";
+				const stage = this.activeAttachmentStatus ? `，附件：${this.activeAttachmentStatus}` : "";
+				const recent = this.toolTrail.splice(0, this.toolTrail.length);
+				let steps = "";
+				if (recent.length > 0) {
+					const shown = recent.slice(-5);
+					steps = "\n最近操作：\n" + shown.map((x, idx) => `${idx + 1}. ${x}`).join("\n");
+					if (recent.length > shown.length) steps += `\n…以及另外 ${recent.length - shown.length} 个操作`;
+				}
+				const text = `⏳ 仍在处理，已用时 ${Math.floor(secs / 60)} 分 ${secs % 60} 秒${doing}${stage}${steps}`;
+				const target: QQReplyTarget = {
+					type: msg.type,
+					userOpenId: msg.userOpenId,
+					groupOpenId: msg.groupOpenId,
+					msgId: msg.id,
+					createdAt: Date.now(),
+				};
+				void this.api?.sendActiveText(target, text).catch((err: unknown) => {
+					this.debugLog(`heartbeat failed: ${err instanceof Error ? err.message : String(err)}`);
+				});
+			}, hbMs);
+			this.heartbeatTimers.set(input.msg.id, timer);
+		}
 	}
 
 	private cancelInputProgressAck(input: ActiveConversationInput): void {
 		input.ackCancelled = true;
 		if (input.ackTimer) clearTimeout(input.ackTimer);
 		input.ackTimer = undefined;
+		const hb = this.heartbeatTimers.get(input.msg.id);
+		if (hb) {
+			clearInterval(hb);
+			this.heartbeatTimers.delete(input.msg.id);
+		}
+		this.activeToolStatus = undefined;
+		this.toolTrail.length = 0;
 	}
 
 	private async cleanupActiveInput(input: ActiveConversationInput): Promise<void> {
@@ -785,6 +830,9 @@ export class PiQQBotRuntime {
 		} else if (event.kind === "assistant_end") {
 			this.emit({ kind: "assistant_end", messageId, at });
 		} else if (event.kind === "tool_start") {
+			this.activeToolStatus = describeToolCall(event.toolName, event.args);
+			this.toolTrail.push(this.activeToolStatus);
+			if (this.toolTrail.length > 50) this.toolTrail.splice(0, this.toolTrail.length - 50);
 			this.emit({
 				kind: "tool_start",
 				messageId,
@@ -794,6 +842,7 @@ export class PiQQBotRuntime {
 				at,
 			});
 		} else {
+			this.activeToolStatus = undefined;
 			this.emit({
 				kind: "tool_end",
 				messageId,
@@ -1393,8 +1442,19 @@ export class PiQQBotRuntime {
 		const maxChunks = Math.min(chunks.length, forcePlain ? Math.min(1, remainingBudget) : remainingBudget);
 		let useMarkdown = replyFormat !== "plain";
 		let delivery = useMarkdown ? "markdown" : "plain";
+		// 被动回复窗口(5min)/次数用尽后改用主动消息，保证答案一定能送达
+		let activeMode = false;
 		for (let i = 0; i < maxChunks; i++) {
 			try {
+				if (activeMode) {
+					if (useMarkdown) {
+						await this.api.sendActiveMarkdown(target, formatted.markdown[i], i === maxChunks - 1 ? keyboard : undefined);
+					} else {
+						await this.api.sendActiveText(target, formatted.plain[i]);
+					}
+					sentChunks++;
+					continue;
+				}
 				if (!useMarkdown) {
 					await this.api.sendText(target, formatted.plain[i], nextMsgSeq++);
 				} else {
@@ -1415,6 +1475,27 @@ export class PiQQBotRuntime {
 				sentChunks++;
 			} catch (err) {
 				const detail = err instanceof QQApiError ? err.message : String(err);
+				if (!activeMode) {
+					try {
+						if (useMarkdown) {
+							await this.api.sendActiveMarkdown(target, formatted.markdown[i], i === maxChunks - 1 ? keyboard : undefined);
+						} else {
+							await this.api.sendActiveText(target, formatted.plain[i]);
+						}
+						activeMode = true;
+						delivery = "active-fallback";
+						sentChunks++;
+						this.debugLog(`passive send failed (${detail}); switched to active messages`);
+						continue;
+					} catch (err2) {
+						const d2 = err2 instanceof QQApiError ? err2.message : String(err2);
+						this.lastError = `send failed: ${detail}; active fallback failed: ${d2}`;
+						this.emit({ kind: "reply_end", messageId: target.msgId, ok: false, sentChunks, error: this.lastError, at: Date.now() });
+						this.debugLog(this.lastError);
+						this.notify(`pi-qqbot send failed: ${d2}`, "error");
+						return;
+					}
+				}
 				this.lastError = `send failed: ${detail}`;
 				this.emit({
 					kind: "reply_end",
@@ -1858,4 +1939,22 @@ function formatWithProcess(transcript: string[], finalText: string): string {
 	if (!transcript.length) return finalText;
 	const answer = finalText.trim() || "（无文本回复）";
 	return `${answer}\n\n***\n\n## 执行摘要\n\n${transcript.join("\n")}`;
+}
+
+
+/** 把一次工具调用压缩成一句话摘要，用于长任务心跳。 */
+function describeToolCall(toolName: string, args: unknown): string {
+	let hint = "";
+	if (args && typeof args === "object") {
+		const a = args as Record<string, unknown>;
+		for (const key of ["command", "cmd", "path", "file_path", "filePath", "query", "url", "pattern", "description", "prompt"]) {
+			const v = a[key];
+			if (typeof v === "string" && v.trim()) {
+				hint = v.replace(/\s+/g, " ").trim();
+				break;
+			}
+		}
+	}
+	if (!hint) return toolName;
+	return `${toolName}（${hint.length > 48 ? `${hint.slice(0, 48)}…` : hint}）`;
 }

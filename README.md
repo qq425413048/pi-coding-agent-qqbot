@@ -277,6 +277,63 @@ QQ 官方机器人不能随意主动推送消息。普通回复必须引用用�
 
 插件采用更保守的 **最多 4 条**回复策略。可靠目标仍是单聊 C2C；群聊长任务可能因窗口过期失败。
 
+### 长任务心跳与主动消息回退（fork 增强）
+
+> 本仓库是 `XiaoSQM/pi-coding-agent-qqbot` 的 fork，在 v0.4.8 基础上增加了下面两个能力。
+> 目标是解决「长任务只回一句『已收到』、随后再也收不到结果」的问题。
+
+**背景**：QQ 官方机器人默认只能做**被动回复**（必须带原消息 `msg_id`），存在窗口期与条数上限。Agent 任务一旦跑过窗口，最终答案就发不出去，用户端只能看到最初那句 ack。
+
+**实测结论**（QQ 官方 API）：
+
+- 主动消息 `POST /v2/users/{openid}/messages` **不带 `msg_id`** → 可用（返回 200）
+- Markdown 消息 `msg_type: 2` 主动发送 → 可用
+- `stream`（原地流式的 markdown 增量字段）→ 被拒绝（`stream.id无效`，多种 id 格式均无效），所以当前无法做「同一条气泡不断更新」
+
+于是改为两条互补策略：
+
+**1. 长任务心跳（主动消息）**
+
+任务执行期间，每 `progress.heartbeatMs`（默认 60000 毫秒）推送一条主动消息，**绕开被动回复窗口**：
+
+```
+⏳ 仍在处理，已用时 2 分 0 秒，正在生成回复
+最近操作：
+1. bash（nvidia-smi --query-gpu=memory.used）
+2. read（/models/config.json）
+3. bash（df -h /models）
+…以及另外 3 个操作
+```
+
+- 「最近操作」来自 `tool_start` 事件的内存队列，**纯本地处理，不调用模型、不产生额外 API 请求、不占用并发**
+- 每次心跳取走并清空队列，最多展示最近 5 条，超出部分用「以及另外 N 个操作」概括
+- 队列上限 50 条；任务结束即清空
+- 没有工具在跑时显示「正在生成回复」；处理附件时额外附带 `附件：<阶段>`
+
+**2. 主动消息回退**
+
+`deliverReply` 在被动回复失败时（窗口过期 / 条数用尽）自动改用主动消息重发当前分片，并将后续分片一并走主动通道，`delivery` 标记为 `active-fallback`。这样**最终答案一定能送达**，不再静默丢失。
+
+**配置**
+
+```json
+{
+  "progress": {
+    "enabled": true,
+    "ackAfterMs": 3000,
+    "heartbeatMs": 60000
+  }
+}
+```
+
+`heartbeatMs: 0` 关闭心跳；上限 600000（10 分钟）。
+
+**限制与注意**
+
+- 主动消息仍受 QQ「用户近期需有互动」规则约束；长时间完全不互动时可能被拦截，此时心跳会静默失败（打开 `debug: true` 可看到 `heartbeat failed` 日志）。
+- 心跳是**多条独立消息**，不是同一条消息原地更新（官方 `stream` 字段不可用）。
+- 该改动修改了插件源码，`pi update` 会覆盖，升级后需重新打补丁。
+
 ### 运行过程可见性
 
 启用扩展的 Pi TUI 会自动附加一个最多 10 行的实时尾部视图，包括已授权 QQ 入站文本、排队/steering/处理状态、Assistant 可见文本流、工具调用开始/结束以及 QQ 回复结果。本地会话替换时旧视图会销毁，新视图自动重新附加，而进程级 QQ 网关保持运行。
@@ -598,6 +655,80 @@ reference the user's original `msg_id`:
 - Group chat: 5-minute window; historical text states up to 5 replies.
 
 The extension therefore uses a conservative maximum of **4 chunks**. C2C remains the reliable target; group replies are best-effort and may fail for long Pi turns.
+
+### Long-task heartbeat and active-message fallback (fork addition)
+
+> This repository is a fork of `XiaoSQM/pi-coding-agent-qqbot` adding the two
+> behaviours below on top of v0.4.8. They fix the failure mode where a long agent
+> run only ever answers "received, processing…" and the real result is never
+> delivered.
+
+**Background**: the official QQ Bot API only supports *passive replies* (each send
+must reference the inbound `msg_id`), with a validity window and a per-message
+reply budget. Once an agent task outlives the window, the final answer cannot be
+sent and the user is left with the initial ack.
+
+**Measured against the live API**:
+
+- Active send `POST /v2/users/{openid}/messages` **without `msg_id`** → accepted (200).
+- Active Markdown (`msg_type: 2`) → accepted.
+- `stream` (in-place markdown streaming) → rejected with `stream.id无效` for every
+  id format tried, so true single-bubble streaming is not available today.
+
+The fork therefore does two complementary things:
+
+**1. Long-task heartbeat over active messages**
+
+While a run is in progress, an active message is pushed every
+`progress.heartbeatMs` (default 60000 ms), bypassing the passive-reply window:
+
+```
+⏳ still working — 2m 0s elapsed, generating a reply
+Recent steps:
+1. bash (nvidia-smi --query-gpu=memory.used)
+2. read (/models/config.json)
+3. bash (df -h /models)
+…and 3 more steps
+```
+
+- The "Recent steps" list comes from a purely in-memory `tool_start` event queue:
+  **no model call, no extra HTTP request, no concurrency cost**.
+- Each heartbeat drains the queue and keeps the last 5 entries, collapsing the
+  rest into "and N more steps".
+- The queue is capped at 50 entries and cleared when the run ends.
+- With no tool running it reports "generating a reply"; attachment work adds
+  `attachment: <stage>`.
+
+**2. Active-message fallback for delivery**
+
+When a passive reply fails (window expired or budget exhausted), `deliverReply`
+retries the chunk as an active message and continues the remaining chunks on that
+path, marking `delivery` as `active-fallback`. The final answer is therefore
+always delivered instead of being silently dropped.
+
+**Configuration**
+
+```json
+{
+  "progress": {
+    "enabled": true,
+    "ackAfterMs": 3000,
+    "heartbeatMs": 60000
+  }
+}
+```
+
+`heartbeatMs: 0` disables the heartbeat; the maximum is 600000 (10 minutes).
+
+**Limitations**
+
+- Active sends are still subject to QQ's "user must have interacted recently"
+  rule and may be rejected after long silence; heartbeats then fail silently
+  (set `debug: true` to see `heartbeat failed`).
+- Heartbeats are separate messages, not in-place updates of one bubble (the
+  official `stream` field is unavailable).
+- The change patches plugin sources; `pi update` overwrites them, so re-apply the
+  patch after upgrading.
 
 ### Process Visibility
 

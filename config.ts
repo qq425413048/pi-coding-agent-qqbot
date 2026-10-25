@@ -82,6 +82,7 @@ const DEFAULTS: PiQQBotConfig = {
 	progress: {
 		enabled: true,
 		ackAfterMs: 3_000,
+		heartbeatMs: 60_000,
 	},
 	outboundMedia: OUTBOUND_MEDIA_DEFAULTS,
 	media: MEDIA_DEFAULTS,
@@ -242,6 +243,7 @@ export function normalizeConfig(parsed: unknown): PiQQBotConfig {
 		progress: {
 			enabled: bool(rawProgress.enabled, DEFAULTS.progress.enabled),
 			ackAfterMs: integer(rawProgress.ackAfterMs, DEFAULTS.progress.ackAfterMs, 0, 60_000),
+			heartbeatMs: integer(rawProgress.heartbeatMs, DEFAULTS.progress.heartbeatMs, 0, 600_000),
 		},
 		debug: bool(raw.debug, false),
 		outboundMedia: {

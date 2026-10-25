@@ -93,6 +93,30 @@ export class QQApi {
 		}, signal);
 	}
 
+	/**
+	 * Send a message that is NOT a passive reply (no msg_id). QQ accepts this only
+	 * when the user interacted with the bot recently; it is not bound to the
+	 * 5-minute reply window and does not consume the reply-chunk budget.
+	 * Used for long-task heartbeats and as a fallback when passive delivery fails.
+	 */
+	async sendActiveText(target: QQReplyTarget, content: string, signal?: AbortSignal): Promise<void> {
+		await this.send(target, { content, msg_type: 0 }, signal);
+	}
+
+	async sendActiveMarkdown(
+		target: QQReplyTarget,
+		content: string,
+		keyboard?: QQKeyboard,
+		signal?: AbortSignal,
+	): Promise<void> {
+		await this.send(target, {
+			markdown: { content },
+			msg_type: 2,
+			...(keyboard ? { keyboard } : {}),
+			...(target.type === "group" ? { content: " " } : {}),
+		}, signal);
+	}
+
 	private async send(target: QQReplyTarget, payload: Record<string, unknown>, signal?: AbortSignal): Promise<void> {
 		const path =
 			target.type === "private"

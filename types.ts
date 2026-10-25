@@ -64,6 +64,14 @@ export interface QQProgressConfig {
 	enabled: boolean;
 	/** Delay before the slow-task ack. 0 sends as soon as the run starts. */
 	ackAfterMs: number;
+	/**
+	 * Heartbeat interval for an ACTIVE (msg_id-less) progress message while the
+	 * agent is still working. Active messages bypass QQ's 5-minute passive-reply
+	 * window, so long tasks keep reporting progress and the final answer can still
+	 * be delivered. Payload also summarises the tool calls of the last interval.
+	 * 0 disables the heartbeat. Default 60000 (60s), max 600000 (10min).
+	 */
+	heartbeatMs: number;
 }
 
 export interface QQCommandConfig {
