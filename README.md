@@ -306,9 +306,22 @@ QQ 官方机器人不能随意主动推送消息。普通回复必须引用用�
 ```
 
 - 「最近操作」来自 `tool_start` 事件的内存队列，**纯本地处理，不调用模型、不产生额外 API 请求、不占用并发**
-- 每次心跳取走并清空队列，最多展示最近 5 条，超出部分用「以及另外 N 个操作」概括
+- 每次心跳取走并清空队列，最多展示最近 **3** 条，超出部分用「以及另外 N 个操作」概括
+- 正在生成时附带**估算速度**（`≈N tok/s`）：插件事件流只有文本增量、没有真实 token 计数，因此按「字符数 ÷ 1.8」估算，仅供体感参考
 - 队列上限 50 条；任务结束即清空
 - 没有工具在跑时显示「正在生成回复」；处理附件时额外附带 `附件：<阶段>`
+
+**敏感信息脱敏**
+
+心跳与 `showProcess` 摘要都会把工具参数展示到 QQ 里，参数中可能带密码或令牌。新增 `redact.ts`，在**出站前**统一替换：
+
+- `echo '密码' | sudo -S …` → `echo '***' | sudo -S …`
+- `export GHTOKEN='ghp_…'`、`--password=…`、`--token=…`、`api_key=…`、`clientSecret=…` → 值变 `***`
+- `Authorization: Bearer …` → `Bearer ***`
+- 常见令牌前缀 `ghp_/gho_/github_pat_/sk-/xoxb-/AKIA…` → `***`
+- URL 内嵌凭据 `scheme://user:pass@host` → 密码变 `***`
+
+> 这是启发式规则，不是绝对保险；不要把明文凭据写进命令行是更根本的做法。
 
 **2. 主动消息回退**
 
@@ -693,11 +706,27 @@ Recent steps:
 
 - The "Recent steps" list comes from a purely in-memory `tool_start` event queue:
   **no model call, no extra HTTP request, no concurrency cost**.
-- Each heartbeat drains the queue and keeps the last 5 entries, collapsing the
+- Each heartbeat drains the queue and keeps the last **3** entries, collapsing the
   rest into "and N more steps".
+- While the model is streaming, an **estimated** speed is shown (`≈N tok/s`). The
+  extension event stream only carries text deltas with no token counts, so the
+  value is derived from characters ÷ 1.8 and is indicative only.
 - The queue is capped at 50 entries and cleared when the run ends.
 - With no tool running it reports "generating a reply"; attachment work adds
   `attachment: <stage>`.
+
+**Secret redaction**
+
+Heartbeats and the `showProcess` summary both surface tool arguments in QQ, which
+may contain passwords or tokens. A new `redact.ts` rewrites outbound text:
+
+- `echo 'pw' | sudo -S …` → `echo '***' | sudo -S …`
+- `export GHTOKEN='ghp_…'`, `--password=…`, `--token=…`, `api_key=…`, `clientSecret=…` → value becomes `***`
+- `Authorization: Bearer …` → `Bearer ***`
+- known token prefixes `ghp_/gho_/github_pat_/sk-/xoxb-/AKIA…` → `***`
+- URL userinfo `scheme://user:pass@host` → password becomes `***`
+
+> Heuristic only — never putting plaintext credentials on a command line remains the real fix.
 
 **2. Active-message fallback for delivery**
 

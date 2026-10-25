@@ -20,6 +20,7 @@ import { authorizeQQCommand, QQ_COMMAND_NAMES, QQ_REMOTE_BLOCKED_COMMANDS } from
 import { normalizeCommandText, parseQQCommand, type ParsedQQCommand } from "./command-parser";
 import { ConversationRegistry, conversationKey } from "./conversation-registry";
 import { formatUserFacingAgentError, humanizeSessionPreview } from "./user-facing";
+import { redactSecrets } from "./redact";
 
 import { QQAccessRequestStore, type QQAccessRequest } from "./access-requests";
 import { AttachmentPipeline, classifyAttachment } from "./attachment-pipeline";
@@ -132,6 +133,9 @@ export class PiQQBotRuntime {
 	private lastError?: string;
 	/** 当前正在执行的工具调用摘要（供长任务心跳展示） */
 	private activeToolStatus?: string;
+	/** 当前这轮生成已输出的字符数与起始时间（用于估算 token/s） */
+	private genChars = 0;
+	private genStartAt?: number;
 	/** 距上次心跳之间发生的工具调用（纯内存记录，不发起任何请求） */
 	private toolTrail: string[] = [];
 	/** 每个会话进行中的心跳定时器 */
@@ -394,7 +398,7 @@ export class PiQQBotRuntime {
 			const deliverySummary = formatDeliverySummary(records);
 			const answer = [deliverySummary, active.finalText.trim()].filter(Boolean).join("\n\n");
 			const body = this.config.showProcess
-				? formatWithProcess(buildTranscript(active.tools), answer)
+				? formatWithProcess(redactSecrets(buildTranscript(active.tools)), answer)
 				: answer;
 			const sentMedia = records.some((record) => record.status === "sent");
 			if (body.trim()) {
@@ -748,16 +752,25 @@ export class PiQQBotRuntime {
 			const timer = setInterval(() => {
 				if (input.ackCancelled || active.stopped || this.activeConversation !== active || !this.running) return;
 				const secs = Math.round((Date.now() - startedAt) / 1000);
-				const doing = this.activeToolStatus ? `，正在执行 ${this.activeToolStatus}` : "，正在生成回复";
+				let speed = "";
+				if (!this.activeToolStatus && this.genStartAt) {
+					const genSecs = (Date.now() - this.genStartAt) / 1000;
+					if (genSecs > 0.5 && this.genChars > 0) {
+						const tps = this.genChars / ESTIMATED_CHARS_PER_TOKEN / genSecs;
+						speed = `（≈${tps.toFixed(1)} tok/s）`;
+					}
+				}
+				const doing = this.activeToolStatus ? `，正在执行 ${this.activeToolStatus}` : `，正在生成回复${speed}`;
 				const stage = this.activeAttachmentStatus ? `，附件：${this.activeAttachmentStatus}` : "";
 				const recent = this.toolTrail.splice(0, this.toolTrail.length);
 				let steps = "";
 				if (recent.length > 0) {
-					const shown = recent.slice(-5);
+					const shown = recent.slice(-3);
 					steps = "\n最近操作：\n" + shown.map((x, idx) => `${idx + 1}. ${x}`).join("\n");
 					if (recent.length > shown.length) steps += `\n…以及另外 ${recent.length - shown.length} 个操作`;
 				}
-				const text = `⏳ 仍在处理，已用时 ${Math.floor(secs / 60)} 分 ${secs % 60} 秒${doing}${stage}${steps}`;
+				// 出站前统一脱敏，避免把密码/令牌带进聊天记录
+				const text = redactSecrets(`⏳ 仍在处理，已用时 ${Math.floor(secs / 60)} 分 ${secs % 60} 秒${doing}${stage}${steps}`);
 				const target: QQReplyTarget = {
 					type: msg.type,
 					userOpenId: msg.userOpenId,
@@ -784,6 +797,8 @@ export class PiQQBotRuntime {
 		}
 		this.activeToolStatus = undefined;
 		this.toolTrail.length = 0;
+		this.genStartAt = undefined;
+		this.genChars = 0;
 	}
 
 	private async cleanupActiveInput(input: ActiveConversationInput): Promise<void> {
@@ -824,10 +839,14 @@ export class PiQQBotRuntime {
 		const messageId = active.current?.msg.id ?? active.rootMessageId;
 		const at = Date.now();
 		if (event.kind === "assistant_start") {
+			this.genStartAt = at;
+			this.genChars = 0;
 			this.emit({ kind: "assistant_start", messageId, at });
 		} else if (event.kind === "assistant_delta") {
+			this.genChars += event.delta.length;
 			this.emit({ kind: "assistant_delta", messageId, delta: event.delta, at });
 		} else if (event.kind === "assistant_end") {
+			this.genStartAt = undefined;
 			this.emit({ kind: "assistant_end", messageId, at });
 		} else if (event.kind === "tool_start") {
 			this.activeToolStatus = describeToolCall(event.toolName, event.args);
@@ -1955,6 +1974,13 @@ function describeToolCall(toolName: string, args: unknown): string {
 			}
 		}
 	}
+	hint = redactSecrets(hint);
 	if (!hint) return toolName;
 	return `${toolName}（${hint.length > 48 ? `${hint.slice(0, 48)}…` : hint}）`;
 }
+
+/**
+ * 中文/代码混合输出的经验字符/token 比，仅用于心跳里的速度**估算**。
+ * 插件的事件流只提供文本增量，没有真实 token 计数。
+ */
+const ESTIMATED_CHARS_PER_TOKEN = 1.8;
